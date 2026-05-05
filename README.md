@@ -8,7 +8,7 @@ O maior gargalo na operação de *squads* de tecnologia é a "fadiga de alertas"
 
 O Córtex-IT resolve este problema entregando **contexto acionável com eficiência de custos**. 
 
-Em vez de forçar as IAs a conversarem entre si — o que consome uma quantidade massiva de *tokens* em APIs de LLM —, o sistema utiliza o banco de dados (`Agentes.db`) como o único meio de comunicação. O resultado é a entrega de um *card* estruturado (pronto para o Jira ou Slack) contendo apenas:
+Em vez de forçar as IAs a conversarem entre si - o que consome uma quantidade massiva de *tokens* em APIs de LLM -, o sistema utiliza o banco de dados (`Agentes.db`) como o único meio de comunicação. O resultado é a entrega de um *card* estruturado (pronto para o Jira ou Slack) contendo apenas:
 * O nível de severidade (ex: P1, P3).
 * O impacto real no negócio (ex: "Carrinho de compras indisponível").
 * O *squad* exato que deve atuar.
