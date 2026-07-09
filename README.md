@@ -13,7 +13,8 @@ Um sistema multiagente inteligente desenhado para automatizar a Gestão de Incid
 5. [Modelagem do Banco de Dados](#modelagem-do-banco-de-dados)
 6. [Fluxo de Processamento por Agente](#fluxo-de-processamento-por-agente)
 7. [Protótipo em Funcionamento](#protótipo-em-funcionamento)
-8. [Saídas do Sistema](#saídas-do-sistema)
+8. [Atividades Semanais](#atividades-semanais)
+9. [Saídas do Sistema](#saídas-do-sistema)
 
 ---
 
@@ -229,6 +230,79 @@ A coleção `incidentes` é o coração do sistema. O documento mostra a estrutu
 ![Tela do dashboard de operações](docs/11.png)
 
 Por fim, o **Dashboard** consolida a visão executiva do sistema: número de *logs* pendentes, quantidade de **incidentes únicos** e a **taxa de compressão** (logs → incidentes), métrica que evidencia diretamente o valor do sistema — quantos eventos brutos foram agrupados em quantos incidentes acionáveis. A tabela inferior lista os incidentes mais recentes com severidade, volume e squad responsável, funcionando como o painel de triagem para as equipes de engenharia.
+
+---
+
+## Atividades Semanais
+
+### Semana 4 (07/07/2026) — Aggregation Pipelines Avançadas
+
+**Requisito:** Implementar 2 *aggregation pipelines* diferentes, cobrindo funcionalidades distintas do sistema, utilizando operadores como `match`, `group`, `sort`, `select`, `lookup`, `project`, `unwind`, `merge`, `set`, `sample`, entre outros. As pipelines foram desenvolvidas e testadas diretamente no **Data Explorer do MongoDB Atlas**, sobre a coleção `incidentes`.
+
+#### Pipeline 1 — Ranking de Squads por Volume de Erros Críticos
+
+**Objetivo:** identificar quais squads concentram o maior volume de erros entre os incidentes classificados como `P1` ou `P2`, permitindo priorizar a alocação de esforço de engenharia.
+
+**Estágios:** `$match` → `$group` → `$sort`
+
+```javascript
+[
+  { $match: { "analise_da_IA.severidade": { $in: ["P1", "P2"] } } },
+  { $group: {
+      _id: "$analise_da_IA.squad_responsavel",
+      total_erros: { $sum: "$total_de_erros" }
+  }},
+  { $sort: { total_erros: -1 } }
+]
+```
+
+![Estágios $match e $group do Pipeline 1](docs/12.jpeg)
+![Estágio $sort do Pipeline 1](docs/13.jpeg)
+
+**Log de saída:**
+```
+_id: "squad-checkout"    total_erros: 5
+_id: "squad-seguranca"   total_erros: 1
+```
+
+#### Pipeline 2 — Timeline de Eventos por Incidente
+
+**Objetivo:** desmembrar o array `historico_temporal` de cada incidente para gerar uma linha do tempo evento a evento, útil para identificar picos de ocorrência e cruzar com a assinatura do erro e o squad responsável.
+
+**Estágios:** `$unwind` → `$project`
+
+```javascript
+[
+  { $unwind: "$historico_temporal" },
+  { $project: {
+      data: "$historico_temporal.periodo",
+      assinatura: "$assinatura_do_erro",
+      squad: "$analise_da_IA.squad_responsavel",
+      _id: 0
+  }}
+]
+```
+
+![Estágios $unwind e $project do Pipeline 2](docs/14.jpeg)
+
+**Log de saída (amostra):**
+```
+{ data: "2026-07-07T15:52:19.347221", assinatura: "PSQLException_Error", squad: "squad-checkout" }
+{ data: "2026-07-07T15:52:19.483862", assinatura: "PSQLException_Error", squad: "squad-checkout" }
+{ data: "2026-07-07T15:52:19.528763", assinatura: "PSQLException_Error", squad: "squad-checkout" }
+```
+
+#### Índices da Coleção `incidentes`
+
+Como evidência complementar do requisito de indexação implementado desde a versão em nuvem, seguem os índices ativos na coleção, confirmados no painel **Indexes** do Atlas:
+
+![Índices ativos na coleção incidentes](docs/15.jpeg)
+
+| Índice | Tipo | Propriedade | Status |
+|---|---|---|---|
+| `_id_` | REGULAR | UNIQUE | READY |
+| `assinatura_do_erro_1` | REGULAR | UNIQUE | READY |
+| `analise_da_IA.severidade_1` | REGULAR | — | READY |
 
 ---
 

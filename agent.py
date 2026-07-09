@@ -1,28 +1,64 @@
 import streamlit as st
-from tinydb import TinyDB, Query
+from pymongo import MongoClient, ASCENDING
 import pandas as pd
 from datetime import datetime
 import uuid
 import re
+import os
+from dotenv import load_dotenv
+
 
 # ============================================================================
-# CONFIGURAÇÃO DO BANCO (MODELAGEM UML)
+# CONFIGURAÇÃO DO BANCO (MONGODB ATLAS - NUVEM)
 # ============================================================================
 
-db = TinyDB('sentinel_nosql.json')
-logs_table = db.table('logs_brutos')
-context_table = db.table('contexto_negocio')
-incidents_table = db.table('incidentes')
+# Carrega as variáveis definidas no arquivo .env (não deve ser versionado no Git)
+load_dotenv()
 
-st.set_page_config(page_title="Sentinel NoSQL - Estruturado", layout="wide")
-st.title("Sentinel NoSQL: AIOps Incident Manager")
+# String de conexão lida do ambiente, com as credenciais fora do código-fonte
+uri = os.getenv("MONGODB_URI")
+
+if not uri:
+    st.error("Variável MONGODB_URI não encontrada. Verifique se o arquivo .env está configurado corretamente.")
+    st.stop()
+
+try:
+    # 1. Estabelece a conexão com o cluster
+    client = MongoClient(uri)
+    db = client['sentinel_db']
+
+    # 2. Testa se a conexão está ativa (Ping) - falha rápido se a URI/rede estiverem erradas
+    client.admin.command('ping')
+
+    # 3. Define as coleções (equivalente a "tabelas" em bancos relacionais)
+    logs_table = db['logs_brutos']
+    context_table = db['contexto_negocio']
+    incidents_table = db['incidentes']
+
+    # 4. IMPLEMENTAÇÃO DE 2 ÍNDICES (Requisito do Professor)
+    # Índice único: garante que não existam incidentes duplicados para a mesma assinatura de erro
+    incidents_table.create_index([("assinatura_do_erro", ASCENDING)], unique=True)
+    # Índice simples: acelera filtros/consultas por severidade (P1, P2, P3)
+    incidents_table.create_index([("analise_da_IA.severidade", ASCENDING)])
+
+    st.sidebar.success("Conectado ao MongoDB Atlas! ☁️")
+
+except Exception as e:
+    # Se a conexão ou os índices falharem, encerra o app para evitar estado inconsistente
+    st.error(f"Erro fatal de conexão ou configuração: {e}")
+    st.stop()
+
+# Configuração da página Streamlit
+st.set_page_config(page_title="Sentinel NoSQL - MongoDB Cloud", layout="wide")
+st.title("Sentinel NoSQL: AIOps Incident Manager 🚀 (Cloud Edition)")
+
 
 # ============================================================================
 # AGENTES BÁSICOS
 # ============================================================================
 
 def agente_1_extrair_erro(texto_bruto: str) -> dict:
-    """Agente 1: Extrai padrão do erro"""
+    """Agente 1: classifica o log bruto em um tipo de erro e gera uma assinatura padronizada."""
     if "PSQLException" in texto_bruto or "PostgreSQL" in texto_bruto:
         tipo, assinatura = "DATABASE", "PSQLException_Error"
     elif "Connection timeout" in texto_bruto or "timeout" in texto_bruto.lower():
@@ -33,14 +69,16 @@ def agente_1_extrair_erro(texto_bruto: str) -> dict:
         tipo, assinatura = "MEMORY", "OutOfMemory_Error"
     else:
         tipo, assinatura = "OUTRO", "UnknownError"
-
     return {"assinatura_do_erro": assinatura, "tipo": tipo}
 
+
 def agente_2_analisar(assinatura: str, tipo: str, aplicativo: str, contextos: list) -> dict:
-    """Agente 2: Injeta contexto e analisa impacto"""
+    """Agente 2: cruza o erro com o contexto de negócio para definir severidade, impacto e squad responsável."""
+    # Busca o contexto do serviço afetado; usa fallback se o serviço não estiver cadastrado
     ctx = next((c for c in contextos if c.get('nome_do_servico') == aplicativo),
                {'squad_responsavel': 'unknown', 'criticidade': 'BAIXA'})
 
+    # Regra de severidade: serviços críticos com falha de banco/rede viram P1
     if ctx['criticidade'] == 'ALTA' and tipo in ['DATABASE', 'NETWORK']:
         severidade = "P1"
     elif tipo == 'NETWORK':
@@ -48,12 +86,10 @@ def agente_2_analisar(assinatura: str, tipo: str, aplicativo: str, contextos: li
     else:
         severidade = "P3"
 
-    if "pagamento" in aplicativo:
-        impacto = "Checkout indisponível - usuários não conseguem comprar"
-    elif "usuario" in aplicativo or "auth" in aplicativo:
-        impacto = "Login indisponível - usuários não conseguem acessar"
-    else:
-        impacto = "Serviço indisponível"
+    # Mapeamento simples de impacto de negócio a partir do nome do aplicativo
+    impacto = "Serviço indisponível"
+    if "pagamento" in aplicativo: impacto = "Checkout indisponível"
+    elif "usuario" in aplicativo: impacto = "Login indisponível"
 
     return {
         "severidade": severidade,
@@ -62,189 +98,176 @@ def agente_2_analisar(assinatura: str, tipo: str, aplicativo: str, contextos: li
         "acao_sugerida": f"Investigar erro: {assinatura}"
     }
 
+
 def agente_3_formatar(assinatura: str, analise: dict, total_erros: int) -> str:
-    """Agente 3: Formata payload para saída"""
-    return f"[{analise['severidade']}] {assinatura}\nVolume: {total_erros} ocorrência(s)\nImpacto: {analise['impacto_no_negocio']}\nSquad: {analise['squad_responsavel']}\nAção: {analise['acao_sugerida']}"
+    """Agente 3: gera a mensagem resumida usada na integração de saída (ex: Slack)."""
+    return f"[{analise['severidade']}] {assinatura} | Vol: {total_erros} | Squad: {analise['squad_responsavel']}"
+
+
+# ============================================================================
+# FUNÇÕES DE AGREGAÇÃO (PIPELINES - Requisito do Professor)
+# ============================================================================
+
+def run_pipeline_squad_ranking():
+    """Pipeline 1: ranking de squads com mais incidentes críticos (Match, Group, Sort, Project)."""
+    pipeline = [
+        # Filtra apenas incidentes críticos (P1/P2)
+        {"$match": {"analise_da_IA.severidade": {"$in": ["P1", "P2"]}}},
+        # Agrupa por squad, somando quantidade de incidentes e volume total de erros
+        {"$group": {
+            "_id": "$analise_da_IA.squad_responsavel",
+            "total_incidentes": {"$sum": 1},
+            "volume_erros": {"$sum": "$total_de_erros"}
+        }},
+        # Ordena do squad com mais erros para o com menos
+        {"$sort": {"volume_erros": -1}},
+        # Renomeia campos para exibição final
+        {"$project": {
+            "squad": "$_id",
+            "incidentes_criticos": "$total_incidentes",
+            "volume_erros": 1,
+            "_id": 0
+        }}
+    ]
+    return list(incidents_table.aggregate(pipeline))
+
+
+def run_pipeline_timeline_unwind():
+    """Pipeline 2: linha do tempo dos eventos de erro (Unwind, Set, Project)."""
+    pipeline = [
+        # Desmembra o array de histórico temporal em um documento por evento
+        {"$unwind": "$historico_temporal"},
+        # Cria/renomeia campos auxiliares para facilitar o project seguinte
+        {"$set": {
+            "data_evento": "$historico_temporal.periodo",
+            "assinatura": "$assinatura_do_erro"
+        }},
+        # Seleciona apenas os campos relevantes para a timeline
+        {"$project": {
+            "data_evento": 1,
+            "assinatura": 1,
+            "severidade": "$analise_da_IA.severidade",
+            "_id": 0
+        }},
+        # Mostra os eventos mais recentes primeiro, limitado aos últimos 10
+        {"$sort": {"data_evento": -1}},
+        {"$limit": 10}
+    ]
+    return list(incidents_table.aggregate(pipeline))
+
 
 # ============================================================================
 # INTERFACE E FLUXOS
 # ============================================================================
 
-menu = st.sidebar.selectbox("Menu", ["Dashboard", "Logs (Agente 1)", "Contexto", "Rodar Agentes", "CRUD Geral"])
+menu = st.sidebar.selectbox("Menu", ["Dashboard", "Logs (Agente 1)", "Contexto", "Rodar Agentes", "Analytics & Performance", "CRUD Geral"])
 
 if menu == "Contexto":
+    # Tela para cadastrar o contexto de negócio de cada serviço (squad responsável e criticidade)
     st.header("Contexto de Negócio")
     col1, col2 = st.columns(2)
-    with col1: servico = st.text_input("Serviço (ex: api-pagamentos-v2)")
+    with col1: servico = st.text_input("Serviço (ex: api-pagamentos)")
     with col2: squad = st.text_input("Squad (ex: squad-checkout)")
 
     if st.button("Salvar Contexto"):
         if servico and squad:
-            context_table.insert({
-                '_id': f"ctx_{uuid.uuid4().hex[:6]}",
-                'nome_do_servico': servico,
-                'squad_responsavel': squad,
-                'criticidade': 'ALTA'
-            })
-            st.success("Contexto salvo estruturado com sucesso.")
-        else:
-            st.error("Preencha todos os campos.")
+            context_table.insert_one({'_id': f"ctx_{uuid.uuid4().hex[:6]}", 'nome_do_servico': servico, 'squad_responsavel': squad, 'criticidade': 'ALTA'})
+            st.success("Contexto salvo no MongoDB Atlas.")
 
-    st.divider()
-    if context_table.all(): st.table(pd.DataFrame(context_table.all()))
+    ctx_data = list(context_table.find())
+    if ctx_data: st.table(pd.DataFrame(ctx_data))
 
 elif menu == "Logs (Agente 1)":
+    # Tela de ingestão manual de logs brutos, ainda não processados pelos agentes
     st.header("Ingestão de Logs Brutos")
-    log = st.text_area("Cole o log de erro aqui:", placeholder="[ERROR] 2026-05-11 08:05:12 - api-pagamentos-v2 - PSQLException: too many clients", height=150)
-
+    log = st.text_area("Cole o log de erro aqui:", placeholder="Ex: [ERROR] api-pagamentos - PSQLException...", height=150)
     if st.button("Injetar Log"):
         if log:
+            # Extrai o nome do aplicativo a partir do padrão "- nome-do-app -" no log
             match = re.search(r'-\s+(\w+(?:-\w+)*)\s+-', log)
             app = match.group(1) if match else "desconhecido"
-
-            logs_table.insert({
-                '_id': f"log_{uuid.uuid4().hex[:6]}",
-                'timestamp': datetime.now().isoformat(),
-                'aplicativo': app,
-                'texto_bruto': log,
-                'processado_pelo_agente_1': False
-            })
-            st.success("Log injetado com sucesso.")
-        else:
-            st.error("Cole um log válido.")
-
-    st.divider()
-    logs_nao_proc = logs_table.search(Query().processado_pelo_agente_1 == False)
-    if logs_nao_proc:
-        for l in logs_nao_proc: st.warning(f"Pendente - {l['_id']}: {l['texto_bruto'][:100]}...")
+            logs_table.insert_one({'_id': f"log_{uuid.uuid4().hex[:6]}", 'timestamp': datetime.now().isoformat(), 'aplicativo': app, 'texto_bruto': log, 'processado_pelo_agente_1': False})
+            st.success("Log salvo na nuvem.")
 
 elif menu == "Rodar Agentes":
-    st.header("Motor de Agentes")
+    # Executa a pipeline completa dos agentes sobre todos os logs ainda não processados
+    st.header("Motor de Agentes (Pipeline)")
     if st.button("Executar Agentes"):
-        logs_nao_proc = logs_table.search(Query().processado_pelo_agente_1 == False)
-        contextos = context_table.all()
+        logs_nao_proc = list(logs_table.find({"processado_pelo_agente_1": False}))
+        contextos = list(context_table.find())
 
-        if not logs_nao_proc:
-            st.warning("Nenhum log pendente para processar.")
-        else:
-            progress_bar = st.progress(0)
-            Incidente = Query()
-
+        if logs_nao_proc:
+            bar = st.progress(0)
             for i, log in enumerate(logs_nao_proc):
-                agora = datetime.now().isoformat()
-                
-                # 1. Agente 1 (Coletor)
                 res_ag1 = agente_1_extrair_erro(log['texto_bruto'])
-                assinatura_atual = res_ag1['assinatura_do_erro']
+                assinatura = res_ag1['assinatura_do_erro']
+                incidente = incidents_table.find_one({"assinatura_do_erro": assinatura})
 
-                # 2. Verifica se o Incidente já existe no banco
-                incidente_existente = incidents_table.search(Incidente.assinatura_do_erro == assinatura_atual)
-
-                if incidente_existente:
-                    # BUCKETING (Agrega no array historico_temporal)
-                    inc = incidente_existente[0]
-                    novo_total = inc['total_de_erros'] + 1
-                    
-                    historico = inc.get('historico_temporal', [])
-                    historico.append({"periodo": agora, "ocorrencias": 1})
-                    
-                    nova_mensagem = agente_3_formatar(assinatura_atual, inc['analise_da_IA'], novo_total)
-                    
-                    incidents_table.update({
-                        'total_de_erros': novo_total,
-                        'historico_temporal': historico,
-                        'integracao_saida': {'slack': nova_mensagem}
-                    }, Incidente._id == inc['_id'])
-                
-                else:
-                    # NOVO INCIDENTE: Fluxo completo
-                    res_ag2 = agente_2_analisar(assinatura_atual, res_ag1['tipo'], log['aplicativo'], contextos)
-                    mensagem = agente_3_formatar(assinatura_atual, res_ag2, 1)
-
-                    incidents_table.insert({
-                        '_id': f"inc_{uuid.uuid4().hex[:6]}",
-                        'status': 'ANALISADO',
-                        'assinatura_do_erro': assinatura_atual,
-                        'total_de_erros': 1,
-                        'historico_temporal': [{"periodo": agora, "ocorrencias": 1}],
-                        'analise_da_IA': res_ag2,
-                        'integracao_saida': {
-                            'slack': mensagem,
-                            'jira': "pendente"
-                        }
+                if incidente:
+                    # Incidente já existe: apenas incrementa o volume e registra novo evento na timeline
+                    novo_total = incidente['total_de_erros'] + 1
+                    msg = agente_3_formatar(assinatura, incidente['analise_da_IA'], novo_total)
+                    incidents_table.update_one({'_id': incidente['_id']}, {
+                        '$set': {'total_de_erros': novo_total, 'integracao_saida.slack': msg},
+                        '$push': {'historico_temporal': {"periodo": datetime.now().isoformat(), "ocorrencias": 1}}
                     })
-
-                # Atualiza Log Bruto como processado
-                logs_table.update({'processado_pelo_agente_1': True}, Query()._id == log['_id'])
-                progress_bar.progress((i + 1) / len(logs_nao_proc))
-            
-            progress_bar.empty()
-            st.success("Processamento concluído com sucesso.")
+                else:
+                    # Novo tipo de erro: roda Agente 2 (análise) e cria o incidente do zero
+                    res_ag2 = agente_2_analisar(assinatura, res_ag1['tipo'], log['aplicativo'], contextos)
+                    incidents_table.insert_one({
+                        '_id': f"inc_{uuid.uuid4().hex[:6]}", 'assinatura_do_erro': assinatura, 'total_de_erros': 1,
+                        'analise_da_IA': res_ag2, 'historico_temporal': [{"periodo": datetime.now().isoformat(), "ocorrencias": 1}],
+                        'integracao_saida': {'slack': agente_3_formatar(assinatura, res_ag2, 1)}
+                    })
+                # Marca o log como processado para não ser reprocessado em execuções futuras
+                logs_table.update_one({'_id': log['_id']}, {'$set': {'processado_pelo_agente_1': True}})
+                bar.progress((i + 1) / len(logs_nao_proc))
+            st.success("Processamento concluído!")
             st.rerun()
 
-    st.divider()
-    incidentes = incidents_table.all()
-    if incidentes:
-        for inc in incidentes[-5:]:
-            st.markdown(f"**{inc['analise_da_IA']['severidade']} | {inc['assinatura_do_erro']}**")
-            st.info(inc['integracao_saida']['slack'])
-
 elif menu == "Dashboard":
-    st.header("Dashboard de Operações")
+    # Visão geral: métricas agregadas + tabela de incidentes
+    st.header("Dashboard MongoDB Cloud")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Logs Pendentes", len(logs_table.search(Query().processado_pelo_agente_1 == False)))
-    c2.metric("Incidentes Únicos", len(incidents_table.all()))
-    
-    total = sum(inc.get('total_de_erros', 1) for inc in incidents_table.all())
-    c3.metric("Taxa de Compressão (Logs -> Incidentes)", f"{total} ➔ {len(incidents_table.all())}")
+    c1.metric("Logs Pendentes", logs_table.count_documents({"processado_pelo_agente_1": False}))
+    c2.metric("Incidentes Únicos", incidents_table.count_documents({}))
+
+    # Soma o total de ocorrências de erro em todos os incidentes
+    pipeline_total = [{"$group": {"_id": None, "total": {"$sum": "$total_de_erros"}}}]
+    res = list(incidents_table.aggregate(pipeline_total))
+    c3.metric("Total de Ocorrências", res[0]['total'] if res else 0)
+
+    incidentes = list(incidents_table.find())
+    if incidentes:
+        st.dataframe(pd.DataFrame([{'Assinatura': i['assinatura_do_erro'], 'Severidade': i['analise_da_IA']['severidade'], 'Volume': i['total_de_erros'], 'Squad': i['analise_da_IA']['squad_responsavel']} for i in incidentes]), use_container_width=True)
+
+elif menu == "Analytics & Performance":
+    # Demonstra o uso das pipelines de agregação e dos índices criados
+    st.header("MongoDB Advanced Analytics (Aggregation Pipelines)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("1. Ranking de Squads (Match, Group, Sort)")
+        ranking = run_pipeline_squad_ranking()
+        if ranking: st.table(pd.DataFrame(ranking))
+
+    with col2:
+        st.subheader("2. Timeline Unwind (Unwind, Set, Project)")
+        timeline = run_pipeline_timeline_unwind()
+        if timeline: st.dataframe(pd.DataFrame(timeline))
 
     st.divider()
-    incidentes = incidents_table.all()
-    if incidentes:
-        df_inc = pd.DataFrame([{
-            'ID': inc['_id'],
-            'Assinatura': inc['assinatura_do_erro'],
-            'Severidade': inc['analise_da_IA']['severidade'],
-            'Volume': inc['total_de_erros'],
-            'Squad': inc['analise_da_IA']['squad_responsavel']
-        } for inc in incidentes[-10:]])
-        st.dataframe(df_inc, use_container_width=True)
+    st.subheader("Índices Otimizados (Indexes)")
+    st.write("Foram implementados índices para busca ultra-rápida por assinatura e severidade.")
+    st.json(list(incidents_table.index_information().keys()))
 
 elif menu == "CRUD Geral":
-    st.header("Administração do Banco de Dados")
-    
-    col_view, col_action = st.columns([2, 1])
-    
-    with col_view:
-        colecao = st.selectbox("Escolha a coleção para visualizar", ["logs_brutos", "contexto_negocio", "incidentes"])
-        dados = db.table(colecao).all()
-        if dados: 
-            st.json(dados)
-        else: 
-            st.info(f"Nenhum dado encontrado na coleção: {colecao}")
-            
-    with col_action:
-        st.subheader("Ações")
-        if st.button("Resetar e Criar Dados de Exemplo"):
-            logs_table.truncate()
-            context_table.truncate()
-            incidents_table.truncate()
-            
-            context_table.insert({'_id': 'ctx_1', 'nome_do_servico': 'api-pagamentos-v2', 'squad_responsavel': 'squad-checkout', 'criticidade': 'ALTA'})
-            context_table.insert({'_id': 'ctx_2', 'nome_do_servico': 'api-usuarios', 'squad_responsavel': 'squad-auth', 'criticidade': 'ALTA'})
-            st.success("Banco formatado na nova estrutura."); st.rerun()
-            
-        st.divider()
-        st.subheader("Deletar Registro")
-        id_para_deletar = st.text_input("ID do Documento (ex: ctx_1)")
-        if st.button("Deletar"):
-            if id_para_deletar:
-                q = Query()
-                resultado = db.table(colecao).remove(q._id == id_para_deletar)
-                if resultado:
-                    st.success(f"Documento {id_para_deletar} removido com sucesso!")
-                    st.rerun()
-                else:
-                    st.error("ID não encontrado nesta coleção.")
-            else:
-                st.warning("Insira um ID válido.")
+    # Tela administrativa genérica para inspecionar e limpar qualquer coleção
+    st.header("Admin MongoDB Atlas")
+    colecao_nome = st.selectbox("Selecione a Coleção", ["logs_brutos", "contexto_negocio", "incidentes"])
+    if st.button("Limpar Coleção"):
+        db[colecao_nome].delete_many({})
+        st.rerun()
+
+    dados = list(db[colecao_nome].find())
+    st.json(dados)
