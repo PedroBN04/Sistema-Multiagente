@@ -184,6 +184,23 @@ def run_pipeline_timeline_unwind():
 # INTERFACE E FLUXOS
 # ============================================================================
 
+# CSS para os botões de navegação da sidebar se comportarem como itens de menu:
+# texto alinhado à esquerda (padrão do Streamlit é centralizado) e menos espaço
+# vertical entre eles, já que o hack de espaços em branco para indentar não
+# tinha efeito (o Streamlit corta espaços à esquerda do texto do botão).
+st.markdown("""
+<style>
+section[data-testid="stSidebar"] div[data-testid="stButton"] button {
+    justify-content: flex-start;
+    text-align: left;
+    padding: 0.35rem 0.75rem;
+}
+section[data-testid="stSidebar"] div[data-testid="stButton"] {
+    margin-bottom: 0.15rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Navegação organizada por categoria: cada bloco representa uma etapa do fluxo
 # (Operação = uso diário do sistema | Analytics = consulta/insights | Administração = manutenção)
 CATEGORIAS = {
@@ -197,15 +214,14 @@ if "pagina_atual" not in st.session_state:
 
 st.sidebar.title("Navegação")
 for categoria, paginas in CATEGORIAS.items():
-    st.sidebar.markdown(f"**{categoria}**")
+    st.sidebar.caption(categoria)
     for pagina in paginas:
         esta_ativa = pagina == st.session_state.pagina_atual
-        # Prefixo visual indica em qual tela o usuário está no momento
-        rotulo = f"➡️ {pagina}" if esta_ativa else f"    {pagina}"
+        # Indicador visual da página ativa: seta + cor "primary" (o CSS acima cuida do alinhamento)
+        rotulo = f"➡️ {pagina}" if esta_ativa else pagina
         if st.sidebar.button(rotulo, key=f"nav_{pagina}", use_container_width=True, type="primary" if esta_ativa else "secondary"):
             st.session_state.pagina_atual = pagina
             st.rerun()
-    st.sidebar.markdown("&nbsp;", unsafe_allow_html=True)  # respiro entre categorias
 
 menu = st.session_state.pagina_atual
 
