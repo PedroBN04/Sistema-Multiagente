@@ -1,5 +1,6 @@
 import streamlit as st
 from pymongo import MongoClient, ASCENDING
+import redis
 import pandas as pd
 from datetime import datetime
 import uuid
@@ -47,6 +48,29 @@ except Exception as e:
     # Se a conexão ou os índices falharem, encerra o app para evitar estado inconsistente
     st.error(f"Erro fatal de conexão ou configuração: {e}")
     st.stop()
+
+
+# ============================================================================
+# CONFIGURAÇÃO DO REDIS (ESTRUTURAS EM MEMÓRIA - TEMPO REAL)
+# ============================================================================
+
+redis_uri = os.getenv("REDIS_URI")
+
+if not redis_uri:
+    st.error("Variável REDIS_URI não encontrada. Verifique se o arquivo .env está configurado corretamente.")
+    st.stop()
+
+try:
+    # decode_responses=True faz o cliente devolver str em vez de bytes
+    redis_client = redis.from_url(redis_uri, decode_responses=True)
+    redis_client.ping()
+    st.sidebar.success("Conectado ao Redis Cloud! 🔴")
+except Exception as e:
+    st.error(f"Erro fatal de conexão com o Redis: {e}")
+    st.stop()
+
+# Chave do Sorted Set usado como leaderboard em tempo real (Feature 1)
+REDIS_RANKING_KEY = "ranking:squads"
 
 # Configuração da página Streamlit
 st.set_page_config(page_title="Sentinel NoSQL - MongoDB Cloud", layout="wide")
@@ -160,9 +184,32 @@ def run_pipeline_timeline_unwind():
 # INTERFACE E FLUXOS
 # ============================================================================
 
-menu = st.sidebar.selectbox("Menu", ["Dashboard", "Logs (Agente 1)", "Contexto", "Rodar Agentes", "Analytics & Performance", "CRUD Geral"])
+# Navegação organizada por categoria: cada bloco representa uma etapa do fluxo
+# (Operação = uso diário do sistema | Analytics = consulta/insights | Administração = manutenção)
+CATEGORIAS = {
+    "📥 Operação": ["📝 Contexto de Negócio", "📄 Logs (Agente 1)", "⚙️ Rodar Agentes"],
+    "📊 Analytics": ["🏠 Dashboard", "📈 Analytics (MongoDB + Redis)"],
+    "🛠️ Administração": ["🗄️ CRUD Geral"],
+}
 
-if menu == "Contexto":
+if "pagina_atual" not in st.session_state:
+    st.session_state.pagina_atual = "🏠 Dashboard"
+
+st.sidebar.title("Navegação")
+for categoria, paginas in CATEGORIAS.items():
+    st.sidebar.markdown(f"**{categoria}**")
+    for pagina in paginas:
+        esta_ativa = pagina == st.session_state.pagina_atual
+        # Prefixo visual indica em qual tela o usuário está no momento
+        rotulo = f"➡️ {pagina}" if esta_ativa else f"    {pagina}"
+        if st.sidebar.button(rotulo, key=f"nav_{pagina}", use_container_width=True, type="primary" if esta_ativa else "secondary"):
+            st.session_state.pagina_atual = pagina
+            st.rerun()
+    st.sidebar.markdown("&nbsp;", unsafe_allow_html=True)  # respiro entre categorias
+
+menu = st.session_state.pagina_atual
+
+if menu == "📝 Contexto de Negócio":
     # Tela para cadastrar o contexto de negócio de cada serviço (squad responsável e criticidade)
     st.header("Contexto de Negócio")
     col1, col2 = st.columns(2)
@@ -177,7 +224,7 @@ if menu == "Contexto":
     ctx_data = list(context_table.find())
     if ctx_data: st.table(pd.DataFrame(ctx_data))
 
-elif menu == "Logs (Agente 1)":
+elif menu == "📄 Logs (Agente 1)":
     # Tela de ingestão manual de logs brutos, ainda não processados pelos agentes
     st.header("Ingestão de Logs Brutos")
     log = st.text_area("Cole o log de erro aqui:", placeholder="Ex: [ERROR] api-pagamentos - PSQLException...", height=150)
@@ -189,7 +236,7 @@ elif menu == "Logs (Agente 1)":
             logs_table.insert_one({'_id': f"log_{uuid.uuid4().hex[:6]}", 'timestamp': datetime.now().isoformat(), 'aplicativo': app, 'texto_bruto': log, 'processado_pelo_agente_1': False})
             st.success("Log salvo na nuvem.")
 
-elif menu == "Rodar Agentes":
+elif menu == "⚙️ Rodar Agentes":
     # Executa a pipeline completa dos agentes sobre todos os logs ainda não processados
     st.header("Motor de Agentes (Pipeline)")
     if st.button("Executar Agentes"):
@@ -211,6 +258,7 @@ elif menu == "Rodar Agentes":
                         '$set': {'total_de_erros': novo_total, 'integracao_saida.slack': msg},
                         '$push': {'historico_temporal': {"periodo": datetime.now().isoformat(), "ocorrencias": 1}}
                     })
+                    squad_do_evento = incidente['analise_da_IA']['squad_responsavel']
                 else:
                     # Novo tipo de erro: roda Agente 2 (análise) e cria o incidente do zero
                     res_ag2 = agente_2_analisar(assinatura, res_ag1['tipo'], log['aplicativo'], contextos)
@@ -219,13 +267,22 @@ elif menu == "Rodar Agentes":
                         'analise_da_IA': res_ag2, 'historico_temporal': [{"periodo": datetime.now().isoformat(), "ocorrencias": 1}],
                         'integracao_saida': {'slack': agente_3_formatar(assinatura, res_ag2, 1)}
                     })
+                    squad_do_evento = res_ag2['squad_responsavel']
+
+                # FEATURE 1 (Sorted Set): incrementa em +1 o score do squad no leaderboard em tempo real
+                redis_client.zincrby(REDIS_RANKING_KEY, 1, squad_do_evento)
+
+                # FEATURE 2 (HyperLogLog): registra a assinatura no estimador de erros únicos do serviço.
+                # PFADD é idempotente - assinaturas repetidas não inflam a contagem aproximada.
+                redis_client.pfadd(f"unicos:{log['aplicativo']}", assinatura)
+
                 # Marca o log como processado para não ser reprocessado em execuções futuras
                 logs_table.update_one({'_id': log['_id']}, {'$set': {'processado_pelo_agente_1': True}})
                 bar.progress((i + 1) / len(logs_nao_proc))
             st.success("Processamento concluído!")
             st.rerun()
 
-elif menu == "Dashboard":
+elif menu == "🏠 Dashboard":
     # Visão geral: métricas agregadas + tabela de incidentes
     st.header("Dashboard MongoDB Cloud")
     c1, c2, c3 = st.columns(3)
@@ -241,27 +298,70 @@ elif menu == "Dashboard":
     if incidentes:
         st.dataframe(pd.DataFrame([{'Assinatura': i['assinatura_do_erro'], 'Severidade': i['analise_da_IA']['severidade'], 'Volume': i['total_de_erros'], 'Squad': i['analise_da_IA']['squad_responsavel']} for i in incidentes]), use_container_width=True)
 
-elif menu == "Analytics & Performance":
-    # Demonstra o uso das pipelines de agregação e dos índices criados
-    st.header("MongoDB Advanced Analytics (Aggregation Pipelines)")
+elif menu == "📈 Analytics (MongoDB + Redis)":
+    # Uma única tela reúne as duas camadas de analytics do sistema: agregação exata e
+    # em lote (MongoDB) vs. estruturas em memória, aproximadas e em tempo real (Redis).
+    st.header("Analytics: Exato (MongoDB) vs. Tempo Real (Redis)")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("1. Ranking de Squads (Match, Group, Sort)")
-        ranking = run_pipeline_squad_ranking()
-        if ranking: st.table(pd.DataFrame(ranking))
+    aba_mongo, aba_redis = st.tabs(["🍃 MongoDB — Aggregation Pipelines", "🔴 Redis — Estruturas Comuns e Probabilísticas"])
 
-    with col2:
-        st.subheader("2. Timeline Unwind (Unwind, Set, Project)")
-        timeline = run_pipeline_timeline_unwind()
-        if timeline: st.dataframe(pd.DataFrame(timeline))
+    with aba_mongo:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("1. Ranking de Squads (Match, Group, Sort)")
+            ranking = run_pipeline_squad_ranking()
+            if ranking: st.table(pd.DataFrame(ranking))
 
-    st.divider()
-    st.subheader("Índices Otimizados (Indexes)")
-    st.write("Foram implementados índices para busca ultra-rápida por assinatura e severidade.")
-    st.json(list(incidents_table.index_information().keys()))
+        with col2:
+            st.subheader("2. Timeline Unwind (Unwind, Set, Project)")
+            timeline = run_pipeline_timeline_unwind()
+            if timeline: st.dataframe(pd.DataFrame(timeline))
 
-elif menu == "CRUD Geral":
+        st.divider()
+        st.subheader("Índices Otimizados (Indexes)")
+        st.write("Foram implementados índices para busca ultra-rápida por assinatura e severidade.")
+        st.json(list(incidents_table.index_information().keys()))
+
+    with aba_redis:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("1. Leaderboard de Squads (Sorted Set)")
+            st.caption("Comando: `ZINCRBY` a cada log processado | Leitura: `ZREVRANGE ... WITHSCORES`")
+            # Busca o ranking já ordenado do maior para o menor score (não precisa ordenar em Python)
+            ranking_redis = redis_client.zrevrange(REDIS_RANKING_KEY, 0, -1, withscores=True)
+            if ranking_redis:
+                df_ranking = pd.DataFrame(ranking_redis, columns=["Squad", "Total de Erros"])
+                df_ranking["Total de Erros"] = df_ranking["Total de Erros"].astype(int)
+                st.table(df_ranking)
+            else:
+                st.info("Nenhum evento processado ainda. Rode a etapa 'Rodar Agentes' primeiro.")
+
+        with col2:
+            st.subheader("2. Erros Únicos por Serviço (HyperLogLog)")
+            st.caption("Comando: `PFADD` a cada log processado | Leitura: `PFCOUNT`")
+            # Descobre quais aplicativos já tiveram logs ingeridos, para consultar o HLL de cada um
+            aplicativos = logs_table.distinct("aplicativo")
+            if aplicativos:
+                dados_hll = []
+                for app in aplicativos:
+                    chave = f"unicos:{app}"
+                    # PFCOUNT devolve a cardinalidade ESTIMADA (não exata) com ~0.81% de erro típico
+                    estimativa = redis_client.pfcount(chave)
+                    dados_hll.append({"Aplicativo": app, "Assinaturas Únicas (estimado)": estimativa})
+                st.table(pd.DataFrame(dados_hll))
+                st.caption("O HyperLogLog usa memória fixa (~12KB por chave), independente do volume de dados.")
+            else:
+                st.info("Nenhum log foi ingerido ainda.")
+
+        st.divider()
+        if st.button("🗑️ Limpar Dados do Redis (Ranking + HyperLogLog)"):
+            chaves = [REDIS_RANKING_KEY] + [f"unicos:{app}" for app in logs_table.distinct("aplicativo")]
+            if chaves:
+                redis_client.delete(*chaves)
+            st.rerun()
+
+elif menu == "🗄️ CRUD Geral":
     # Tela administrativa genérica para inspecionar e limpar qualquer coleção
     st.header("Admin MongoDB Atlas")
     colecao_nome = st.selectbox("Selecione a Coleção", ["logs_brutos", "contexto_negocio", "incidentes"])
