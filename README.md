@@ -2,6 +2,8 @@
 
 Um sistema multiagente inteligente desenhado para automatizar a Gestão de Incidentes (AIOps). Operando sobre um banco de dados NoSQL orientado a documentos, o sistema triagem *logs* caóticos, converte falhas técnicas em análises de impacto de negócio e despacha alertas estruturados para equipes de engenharia — eliminando a fadiga de alertas com eficiência de custo escalável.
 
+Link para o protótipo: https://sistema-multiagente.streamlit.app/
+
 ---
 
 ## Sumário
