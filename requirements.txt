@@ -1,0 +1,6 @@
+streamlit
+pymongo
+redis
+pandas
+python-dotenv
+neo4j
