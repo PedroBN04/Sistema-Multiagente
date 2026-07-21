@@ -7,6 +7,7 @@ import uuid
 import re
 import os
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
 
 
 # ============================================================================
@@ -71,6 +72,27 @@ except Exception as e:
 
 # Chave do Sorted Set usado como leaderboard em tempo real (Feature 1)
 REDIS_RANKING_KEY = "ranking:squads"
+
+
+# ============================================================================
+# CONFIGURAÇÃO DO NEO4J (GRAFO DE DEPENDÊNCIAS - AURA)
+# ============================================================================
+
+neo4j_uri = os.getenv("NEO4J_URI")
+neo4j_user = os.getenv("NEO4J_USER")
+neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+if not neo4j_uri or not neo4j_user or not neo4j_password:
+    st.error("Variáveis NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD não encontradas. Verifique o arquivo .env.")
+    st.stop()
+
+try:
+    neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    neo4j_driver.verify_connectivity()
+    st.sidebar.success("Conectado ao Neo4j Aura! 🟢")
+except Exception as e:
+    st.error(f"Erro fatal de conexão com o Neo4j: {e}")
+    st.stop()
 
 # Configuração da página Streamlit
 st.set_page_config(page_title="Sentinel NoSQL - MongoDB Cloud", layout="wide")
@@ -181,6 +203,66 @@ def run_pipeline_timeline_unwind():
 
 
 # ============================================================================
+# FUNÇÕES DO NEO4J (GRAFO DE DEPENDÊNCIAS + GDS)
+# ============================================================================
+
+def registrar_servico_e_squad(servico: str, squad: str):
+    """Espelha o contexto_negocio do MongoDB também no grafo."""
+    with neo4j_driver.session() as session:
+        session.run("""
+            MERGE (s:Servico {nome: $servico})
+            MERGE (sq:Squad {nome: $squad})
+            MERGE (s)-[:PERTENCE_A]->(sq)
+        """, servico=servico, squad=squad)
+
+
+def registrar_dependencia(servico_origem: str, servico_dependencia: str):
+    """Ex: api-notificacao DEPENDE_DE api-pagamentos."""
+    with neo4j_driver.session() as session:
+        session.run("""
+            MERGE (a:Servico {nome: $origem})
+            MERGE (b:Servico {nome: $dependencia})
+            MERGE (a)-[:DEPENDE_DE]->(b)
+        """, origem=servico_origem, dependencia=servico_dependencia)
+
+
+def registrar_incidente_no_grafo(assinatura: str, severidade: str, aplicativo: str):
+    """Chamado dentro do loop de 'Rodar Agentes', ao lado do zincrby e do pfadd."""
+    with neo4j_driver.session() as session:
+        session.run("""
+            MERGE (s:Servico {nome: $aplicativo})
+            CREATE (i:Incidente {assinatura: $assinatura, severidade: $severidade, data: datetime()})
+            CREATE (i)-[:AFETA]->(s)
+        """, aplicativo=aplicativo, assinatura=assinatura, severidade=severidade)
+
+
+def rodar_pagerank_servicos() -> pd.DataFrame:
+    """Roda a projeção GDS + PageRank e devolve um DataFrame, no mesmo estilo dos pipelines Mongo."""
+    with neo4j_driver.session() as session:
+        # Remove a projeção anterior, se existir, para evitar erro de "grafo já existe"
+        session.run("CALL gds.graph.exists('grafoServicos') YIELD exists "
+                     "WITH exists WHERE exists CALL gds.graph.drop('grafoServicos') YIELD graphName RETURN graphName")
+
+        session.run("""
+            CALL gds.graph.project.cypher(
+                'grafoServicos',
+                'MATCH (s:Servico) RETURN id(s) AS id',
+                'MATCH (a:Servico)-[:DEPENDE_DE]->(b:Servico) RETURN id(a) AS source, id(b) AS target'
+            )
+        """)
+
+        resultado = session.run("""
+            CALL gds.pageRank.stream('grafoServicos')
+            YIELD nodeId, score
+            RETURN gds.util.asNode(nodeId).nome AS servico, score
+            ORDER BY score DESC
+        """)
+        dados = [dict(r) for r in resultado]
+        session.run("CALL gds.graph.drop('grafoServicos')")  # libera a memória depois de usar
+        return pd.DataFrame(dados)
+
+
+# ============================================================================
 # INTERFACE E FLUXOS
 # ============================================================================
 
@@ -205,7 +287,7 @@ section[data-testid="stSidebar"] div[data-testid="stButton"] {
 # (Operação = uso diário do sistema | Analytics = consulta/insights | Administração = manutenção)
 CATEGORIAS = {
     "📥 Operação": ["📝 Contexto de Negócio", "📄 Logs (Agente 1)", "⚙️ Rodar Agentes"],
-    "📊 Analytics": ["🏠 Dashboard", "📈 Analytics (MongoDB + Redis)"],
+    "📊 Analytics": ["🏠 Dashboard", "📈 Analytics (MongoDB + Redis)", "🕸️ Grafo de Dependências"],
     "🛠️ Administração": ["🗄️ CRUD Geral"],
 }
 
@@ -235,10 +317,23 @@ if menu == "📝 Contexto de Negócio":
     if st.button("Salvar Contexto"):
         if servico and squad:
             context_table.insert_one({'_id': f"ctx_{uuid.uuid4().hex[:6]}", 'nome_do_servico': servico, 'squad_responsavel': squad, 'criticidade': 'ALTA'})
-            st.success("Contexto salvo no MongoDB Atlas.")
+            # Espelha o mesmo contexto no grafo Neo4j
+            registrar_servico_e_squad(servico, squad)
+            st.success("Contexto salvo no MongoDB Atlas e no Neo4j.")
 
     ctx_data = list(context_table.find())
     if ctx_data: st.table(pd.DataFrame(ctx_data))
+
+    st.divider()
+    st.subheader("Cadastrar Dependência entre Serviços")
+    st.caption("Ex: 'api-notificacao' DEPENDE_DE 'api-pagamentos'")
+    col1, col2 = st.columns(2)
+    with col1: servico_origem = st.text_input("Serviço dependente", key="dep_origem")
+    with col2: servico_alvo = st.text_input("Depende de", key="dep_alvo")
+    if st.button("Salvar Dependência"):
+        if servico_origem and servico_alvo:
+            registrar_dependencia(servico_origem, servico_alvo)
+            st.success("Dependência registrada no Neo4j.")
 
 elif menu == "📄 Logs (Agente 1)":
     # Tela de ingestão manual de logs brutos, ainda não processados pelos agentes
@@ -275,6 +370,7 @@ elif menu == "⚙️ Rodar Agentes":
                         '$push': {'historico_temporal': {"periodo": datetime.now().isoformat(), "ocorrencias": 1}}
                     })
                     squad_do_evento = incidente['analise_da_IA']['squad_responsavel']
+                    severidade_do_evento = incidente['analise_da_IA']['severidade']
                 else:
                     # Novo tipo de erro: roda Agente 2 (análise) e cria o incidente do zero
                     res_ag2 = agente_2_analisar(assinatura, res_ag1['tipo'], log['aplicativo'], contextos)
@@ -284,6 +380,7 @@ elif menu == "⚙️ Rodar Agentes":
                         'integracao_saida': {'slack': agente_3_formatar(assinatura, res_ag2, 1)}
                     })
                     squad_do_evento = res_ag2['squad_responsavel']
+                    severidade_do_evento = res_ag2['severidade']
 
                 # FEATURE 1 (Sorted Set): incrementa em +1 o score do squad no leaderboard em tempo real
                 redis_client.zincrby(REDIS_RANKING_KEY, 1, squad_do_evento)
@@ -291,6 +388,9 @@ elif menu == "⚙️ Rodar Agentes":
                 # FEATURE 2 (HyperLogLog): registra a assinatura no estimador de erros únicos do serviço.
                 # PFADD é idempotente - assinaturas repetidas não inflam a contagem aproximada.
                 redis_client.pfadd(f"unicos:{log['aplicativo']}", assinatura)
+
+                # FEATURE 3 (Grafo Neo4j): registra o incidente como nó ligado ao serviço afetado
+                registrar_incidente_no_grafo(assinatura, severidade_do_evento, log['aplicativo'])
 
                 # Marca o log como processado para não ser reprocessado em execuções futuras
                 logs_table.update_one({'_id': log['_id']}, {'$set': {'processado_pelo_agente_1': True}})
@@ -376,6 +476,43 @@ elif menu == "📈 Analytics (MongoDB + Redis)":
             if chaves:
                 redis_client.delete(*chaves)
             st.rerun()
+
+elif menu == "🕸️ Grafo de Dependências":
+    # Camada de grafo (Neo4j + GDS): mapeia dependências entre serviços e identifica
+    # os pontos mais críticos da arquitetura via PageRank - algo que o Mongo e o Redis
+    # não conseguem responder bem, pois exige atravessar relacionamentos.
+    st.header("Grafo de Dependências (Neo4j + GDS)")
+    st.caption("Modelo: (Incidente)-[AFETA]->(Servico)-[PERTENCE_A]->(Squad) | (Servico)-[DEPENDE_DE]->(Servico)")
+
+    if st.button("Rodar PageRank (Serviços mais críticos)"):
+        try:
+            df_pagerank = rodar_pagerank_servicos()
+            if not df_pagerank.empty:
+                st.subheader("Ranking de criticidade estrutural")
+                st.caption("Quanto maior o score, mais outros serviços dependem dele - candidato natural a P1.")
+                st.dataframe(df_pagerank, use_container_width=True)
+            else:
+                st.info("Nenhum serviço/dependência cadastrado ainda. Cadastre em 'Contexto de Negócio'.")
+        except Exception as e:
+            st.error(f"Erro ao rodar GDS: {e}. Verifique se sua instância Aura tem o plugin GDS habilitado.")
+
+    st.divider()
+    st.subheader("Consulta livre em Cypher")
+    query_livre = st.text_area("Digite uma query Cypher (somente leitura)", value="MATCH (n) RETURN n LIMIT 25")
+    if st.button("Executar Query"):
+        if not query_livre.strip().upper().startswith("MATCH"):
+            st.error("Por segurança, apenas consultas iniciadas com MATCH são permitidas nesta tela.")
+        else:
+            try:
+                with neo4j_driver.session() as session:
+                    resultado = session.run(query_livre)
+                    dados = [dict(r) for r in resultado]
+                if dados:
+                    st.dataframe(pd.DataFrame(dados), use_container_width=True)
+                else:
+                    st.info("Query executada, sem resultados.")
+            except Exception as e:
+                st.error(f"Erro na query: {e}")
 
 elif menu == "🗄️ CRUD Geral":
     # Tela administrativa genérica para inspecionar e limpar qualquer coleção

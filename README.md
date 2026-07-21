@@ -181,7 +181,7 @@ O Agente 3 não armazena dados — ele despacha as saídas para os canais de des
 
 ## Protótipo em Funcionamento
 
-A versão funcional do Sentinel NoSQL foi implementada em **Streamlit**, usando **TinyDB** como banco de dados orientado a documentos (substituindo um NoSQL gerenciado para fins de prototipagem rápida). Abaixo, cada tela do protótipo é apresentada seguindo a ordem natural de uso do sistema: ingestão do log bruto, cadastro do contexto de negócio, execução dos agentes, inspeção das coleções e, por fim, o dashboard consolidado.
+A versão funcional do Sentinel NoSQL foi implementada em **Streamlit**, com **MongoDB Atlas** como banco de documentos na nuvem (a prototipagem inicial usou TinyDB local, migrada posteriormente para a versão gerenciada). Abaixo, cada tela do protótipo é apresentada seguindo a ordem natural de uso do sistema: ingestão do log bruto, cadastro do contexto de negócio, execução dos agentes, inspeção das coleções e, por fim, o dashboard consolidado.
 
 ### 1. Ingestão de Logs Brutos (Agente 1)
 
@@ -303,6 +303,104 @@ Como evidência complementar do requisito de indexação implementado desde a ve
 | `_id_` | REGULAR | UNIQUE | READY |
 | `assinatura_do_erro_1` | REGULAR | UNIQUE | READY |
 | `analise_da_IA.severidade_1` | REGULAR | — | READY |
+
+### Semana 5 (14/07/2026) — Redis: Estruturas Comuns e Probabilísticas
+
+**Requisito:** implementar 2 funcionalidades usando Redis, combinando uma estrutura de dados comum com uma estrutura probabilística, para recursos relevantes do sistema. As duas funcionalidades foram integradas diretamente ao loop de "Rodar Agentes" — cada log processado grava simultaneamente no MongoDB (fonte definitiva) e no Redis (camada de tempo real).
+
+#### Funcionalidade 1 — Leaderboard de Squads em Tempo Real (Sorted Set)
+
+**Objetivo:** manter um ranking sempre ordenado de quais squads mais acumulam erros, sem precisar reprocessar uma agregação no Mongo a cada consulta.
+
+**Estrutura:** Sorted Set (ZSET) — estrutura comum, com ordenação automática O(log N) por escrita.
+
+```python
+# Escrita: incrementa o score do squad a cada evento processado
+redis_client.zincrby(REDIS_RANKING_KEY, 1, squad_do_evento)
+
+# Leitura: já retorna ordenado do maior para o menor score
+redis_client.zrevrange(REDIS_RANKING_KEY, 0, -1, withscores=True)
+```
+
+#### Funcionalidade 2 — Erros Únicos por Serviço (HyperLogLog)
+
+**Objetivo:** estimar quantas assinaturas de erro distintas cada serviço já apresentou, sem guardar cada valor individualmente.
+
+**Estrutura:** HyperLogLog — estrutura probabilística, com memória fixa (~12KB por chave) independente do volume de dados, em troca de uma margem de erro típica de ~0,81% na contagem.
+
+```python
+# PFADD é idempotente: assinaturas repetidas não inflam a contagem
+redis_client.pfadd(f"unicos:{aplicativo}", assinatura)
+
+# PFCOUNT devolve a cardinalidade ESTIMADA (não exata)
+redis_client.pfcount(f"unicos:{aplicativo}")
+```
+
+**Por que essa dupla:** contrasta uma estrutura que ordena/agrega com exatidão (ZSET) com outra que estima cardinalidade em espaço constante (HyperLogLog) — a mesma pergunta ("quantos erros únicos?") resolvida com um Set comum cresceria proporcionalmente ao volume de dados; o HyperLogLog não.
+
+*(Screenshots pendentes: tela "Analytics → aba Redis" mostrando as duas tabelas populadas, e o log de saída do `ZREVRANGE`/`PFCOUNT` rodado direto no RedisInsight ou `redis-cli` — adicionar como `docs/16.jpeg` e `docs/17.jpeg`.)*
+
+### Semana 6 (21/07/2026) — Neo4j: Grafo de Dependências e Graph Data Science
+
+**Requisito:** criar um grafo e identificar uma operação de Graph Data Science (GDS) relevante para o sistema.
+
+#### O Modelo de Grafo
+
+- `(Servico)` — cada aplicação do sistema (ex: `api-pagamentos`)
+- `(Squad)` — o time responsável por cada serviço
+- `(Incidente)` — cada erro detectado pelos agentes
+
+Relacionamentos:
+
+- `(Servico)-[:PERTENCE_A]->(Squad)` — quem é o dono do serviço
+- `(Servico)-[:DEPENDE_DE]->(Servico)` — mapeia a arquitetura de dependências (ex: `api-notificacao` depende de `api-pagamentos`)
+- `(Incidente)-[:AFETA]->(Servico)` — liga cada incidente detectado ao serviço onde ocorreu
+
+```python
+def registrar_dependencia(servico_origem: str, servico_dependencia: str):
+    with neo4j_driver.session() as session:
+        session.run("""
+            MERGE (a:Servico {nome: $origem})
+            MERGE (b:Servico {nome: $dependencia})
+            MERGE (a)-[:DEPENDE_DE]->(b)
+        """, origem=servico_origem, dependencia=servico_dependencia)
+```
+
+#### A Operação de Graph Data Science: PageRank
+
+Sobre a rede de dependências entre serviços, usamos o algoritmo **PageRank**. Ele calcula, para cada serviço, um score que reflete o quanto os outros dependem dele — quanto mais "apontado" um serviço é dentro da cadeia de dependências, maior o score.
+
+```python
+def rodar_pagerank_servicos() -> pd.DataFrame:
+    with neo4j_driver.session() as session:
+        session.run("""
+            CALL gds.graph.project.cypher(
+                'grafoServicos',
+                'MATCH (s:Servico) RETURN id(s) AS id',
+                'MATCH (a:Servico)-[:DEPENDE_DE]->(b:Servico) RETURN id(a) AS source, id(b) AS target'
+            )
+        """)
+        resultado = session.run("""
+            CALL gds.pageRank.stream('grafoServicos')
+            YIELD nodeId, score
+            RETURN gds.util.asNode(nodeId).nome AS servico, score
+            ORDER BY score DESC
+        """)
+        return pd.DataFrame([dict(r) for r in resultado])
+```
+
+**Por que isso importa pro sistema:** hoje a severidade de um incidente (P1, P2, P3) é decidida por uma regra manual no `agente_2_analisar`, baseada em um campo `criticidade` cadastrado à mão. Com o PageRank, a criticidade passa a ser calculada **estruturalmente**, a partir da topologia real de dependências — um serviço do qual muitos outros dependem é naturalmente mais crítico, mesmo que ninguém tenha marcado isso manualmente no cadastro. Isso é um sinal a mais para reforçar (ou até substituir) a lógica de severidade dos agentes.
+
+#### Onde entra no fluxo do sistema
+
+1. Ao cadastrar contexto de negócio, o serviço e seu squad são espelhados no grafo (`registrar_servico_e_squad`)
+2. As dependências entre serviços são cadastradas manualmente (`registrar_dependencia`)
+3. Cada incidente detectado pelos agentes também vira um nó no grafo, ligado ao serviço afetado (`registrar_incidente_no_grafo`)
+4. A tela **🕸️ Grafo de Dependências** roda o PageRank sob demanda e mostra o ranking de criticidade estrutural dos serviços
+
+> **Observação técnica:** o algoritmo GDS exige o plugin de Graph Data Science habilitado na instância Neo4j — disponível por padrão no Neo4j Desktop (local) e em planos como AuraDS, mas não em todo tier de Aura. Caso a instância utilizada não tenha o plugin, a tela trata o erro de forma controlada e ainda assim evidencia a modelagem do grafo e a operação GDS identificada como relevante para o sistema.
+
+*(Screenshots pendentes: tela "🕸️ Grafo de Dependências" com o resultado do PageRank — ou o erro tratado, caso o plugin não esteja disponível — e uma consulta Cypher de exemplo no Aura Browser — adicionar como `docs/18.jpeg` e `docs/19.jpeg`.)*
 
 ---
 
